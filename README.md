@@ -39,3 +39,7 @@ Quick example:
 # Log every destination host the IIS worker processes connect to (any port)
 .\net-logger.ps1 -Outbound -Process w3wp -ResolveDns
 ```
+
+---
+
+Copyright (c) 2026 Arley Silveira. All rights reserved.

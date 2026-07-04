@@ -113,6 +113,8 @@
     Shows usage help with examples (-h and -? also work).
 
 .NOTES
+    Copyright (c) 2026 Arley Silveira. All rights reserved.
+
     Requires Windows 8 / Server 2012 or later (Get-NetTCPConnection).
     Process names of listeners resolve best when run as Administrator.
 #>
