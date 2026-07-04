@@ -386,14 +386,15 @@ function Get-SourceDnsName {
 }
 
 function Write-EventLog {
-    param([datetime]$When, [int]$Port, [string]$SourceHost, [int]$SourcePort, [string]$State)
+    param([datetime]$When, [int]$Port, [string]$SourceHost, [int]$SourcePort, [string]$State,
+          [string]$ProcName, [int]$ProcId)
     $desc = Get-PortDescription -Port $Port
     if ([string]::IsNullOrEmpty($desc)) { $desc = 'unknown service' }
     $src = "{0}:{1}" -f $SourceHost, $SourcePort
     $dns = Get-SourceDnsName -Ip $SourceHost
     if ($dns -ne '') { $src = "$src ($dns)" }
-    $line = "{0:yyyy-MM-dd HH:mm:ss} | port {1,5} ({2}) | {3} {4} | {5}" -f `
-            $When, $Port, $desc, $HostRole, $src, $State
+    $line = "{0:yyyy-MM-dd HH:mm:ss} | port {1,5} ({2}) | {3} {4} | {5} | process {6} (PID {7})" -f `
+            $When, $Port, $desc, $HostRole, $src, $State, $ProcName, $ProcId
     Add-Content -LiteralPath $EventLogFile -Value $line -Encoding UTF8
 }
 
@@ -421,8 +422,9 @@ function Write-SummaryLog {
             if ($DnsCache.ContainsKey($h.SourceHost) -and $DnsCache[$h.SourceHost] -ne '') {
                 $hostLabel = "{0} ({1})" -f $h.SourceHost, $DnsCache[$h.SourceHost]
             }
-            [void]$sb.AppendLine(("  {0,-56} connections: {1,-5} first: {2:yyyy-MM-dd HH:mm:ss}  last: {3:yyyy-MM-dd HH:mm:ss}" -f `
-                $hostLabel, $h.Count, $h.FirstSeen, $h.LastSeen))
+            $procList = (@($h.Processes.Keys) | Sort-Object) -join ','
+            [void]$sb.AppendLine(("  {0,-56} connections: {1,-5} first: {2:yyyy-MM-dd HH:mm:ss}  last: {3:yyyy-MM-dd HH:mm:ss}  process: {4}" -f `
+                $hostLabel, $h.Count, $h.FirstSeen, $h.LastSeen, $procList))
         }
     }
 
@@ -565,9 +567,11 @@ try {
             # The logged host is the remote address in both modes.
             $port    = [int]$conn.LocalPort
             if ($Outbound) { $port = [int]$conn.RemotePort }
-            $srcHost = [string]$conn.RemoteAddress
-            $srcPort = [int]$conn.RemotePort
-            $key     = "{0}:{1}<->{2}" -f $srcHost, $srcPort, [int]$conn.LocalPort
+            $srcHost  = [string]$conn.RemoteAddress
+            $srcPort  = [int]$conn.RemotePort
+            $ownPid   = [int]$conn.OwningProcess
+            $procName = Get-ProcessName -ProcessId $ownPid
+            $key      = "{0}:{1}<->{2}" -f $srcHost, $srcPort, [int]$conn.LocalPort
             [void]$activeKeys.Add($key)
 
             # New connection -> log the event and update statistics
@@ -586,16 +590,19 @@ try {
                         Count      = 1
                         FirstSeen  = $now
                         LastSeen   = $now
+                        Processes  = @{ $procName = $true }
                     }
                 }
                 else {
                     $HostPortStats[$statKey].Count++
                     $HostPortStats[$statKey].LastSeen = $now
+                    $HostPortStats[$statKey].Processes[$procName] = $true
                 }
 
                 # Default: one log entry per individual host at each service port
                 if ($isNewSource -or $LogAllEvents) {
-                    Write-EventLog -When $now -Port $port -SourceHost $srcHost -SourcePort $srcPort -State $conn.State
+                    Write-EventLog -When $now -Port $port -SourceHost $srcHost -SourcePort $srcPort `
+                                   -State $conn.State -ProcName $procName -ProcId $ownPid
                 }
                 $summaryDirty = $true
             }
@@ -609,7 +616,7 @@ try {
                 LocalSocket  = "{0}:{1}" -f $conn.LocalAddress, $conn.LocalPort
                 RemoteSocket = $remoteSocket
                 State        = [string]$conn.State
-                Process      = Get-ProcessName -ProcessId ([int]$conn.OwningProcess)
+                Process      = $procName
                 Service      = Get-PortDescription -Port $port
             }
         }
