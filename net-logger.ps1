@@ -60,10 +60,16 @@
 .PARAMETER RefreshSeconds
     Refresh rate: seconds between polling cycles. Default: 2. Alias: -Refresh.
 
+.PARAMETER Csv
+    Write the logs as CSV files instead of plain text: the host-entry log gets
+    one row per entry (timestamp, port, service, host, DNS name, state,
+    process, PID, app pool) and the summary one row per host@port. Auto-named
+    files use the .csv extension.
+
 .PARAMETER LogFile
     Full path of the output log file for host entries. The summary log is
-    written next to it as <name>_summary.log. Overrides the automatic file
-    naming under -LogDirectory.
+    written next to it as <name>_summary.log (or .csv with -Csv). Overrides
+    the automatic file naming under -LogDirectory.
 
 .PARAMETER LogDirectory
     Directory where log files are written with automatic names (ignored when
@@ -144,6 +150,8 @@ param(
     [ValidateRange(1, 3600)]
     [int]$RefreshSeconds = 2,
 
+    [switch]$Csv,
+
     [string]$LogFile = '',
 
     [string]$LogDirectory = '',
@@ -191,8 +199,9 @@ function Show-Usage {
     Write-Host '                          remote ports.'
     Write-Host '   -WellKnownOnly         Restrict to well-known service ports.'
     Write-Host '   -RefreshSeconds <n>    Refresh rate in seconds (default 2). Alias: -Refresh.'
+    Write-Host '   -Csv                   Write logs as CSV files instead of plain text.'
     Write-Host '   -LogFile <path>        Output log file for host entries; the summary is'
-    Write-Host '                          written next to it as <name>_summary.log.'
+    Write-Host '                          written next to it as <name>_summary.log/.csv.'
     Write-Host '   -LogDirectory <path>   Folder for auto-named logs (default: .\logs).'
     Write-Host '   -ResolveDns            Resolve host IPs to DNS names (background, cached).'
     Write-Host '   -IncludeLoopback       Also report connections from/to 127.0.0.1 / ::1.'
@@ -296,8 +305,11 @@ $ModeName = 'INBOUND'
 $HostRole = 'source'
 if ($Outbound) { $ModeName = 'OUTBOUND'; $HostRole = 'destination' }
 
+$LogExtension = '.log'
+if ($Csv) { $LogExtension = '.csv' }
+
 if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-    # Explicit output log file; summary goes next to it as <name>_summary.log
+    # Explicit output log file; summary goes next to it as <name>_summary.log/.csv
     if (-not [System.IO.Path]::IsPathRooted($LogFile)) {
         $LogFile = Join-Path (Get-Location).Path $LogFile
     }
@@ -307,7 +319,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
     }
     $EventLogFile   = $LogFile
     $SummaryLogFile = Join-Path $LogDirectory `
-        ([System.IO.Path]::GetFileNameWithoutExtension($LogFile) + '_summary.log')
+        ([System.IO.Path]::GetFileNameWithoutExtension($LogFile) + '_summary' + $LogExtension)
 }
 else {
     if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
@@ -317,12 +329,12 @@ else {
         New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
     }
     if ($Outbound) {
-        $EventLogFile   = Join-Path $LogDirectory ("net-logger_destinations_{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
-        $SummaryLogFile = Join-Path $LogDirectory 'net-logger_summary_outbound.log'
+        $EventLogFile   = Join-Path $LogDirectory ("net-logger_destinations_{0}{1}" -f (Get-Date -Format 'yyyy-MM-dd'), $LogExtension)
+        $SummaryLogFile = Join-Path $LogDirectory ('net-logger_summary_outbound' + $LogExtension)
     }
     else {
-        $EventLogFile   = Join-Path $LogDirectory ("net-logger_sources_{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
-        $SummaryLogFile = Join-Path $LogDirectory 'net-logger_summary.log'
+        $EventLogFile   = Join-Path $LogDirectory ("net-logger_sources_{0}{1}" -f (Get-Date -Format 'yyyy-MM-dd'), $LogExtension)
+        $SummaryLogFile = Join-Path $LogDirectory ('net-logger_summary' + $LogExtension)
     }
 }
 
@@ -452,8 +464,26 @@ function Write-EventLog {
           [string]$ProcName, [int]$ProcId, [string]$Pool = '')
     $desc = Get-PortDescription -Port $Port
     if ([string]::IsNullOrEmpty($desc)) { $desc = 'unknown service' }
-    $src = "{0}:{1}" -f $SourceHost, $SourcePort
     $dns = Get-SourceDnsName -Ip $SourceHost
+
+    if ($Csv) {
+        [pscustomobject]@{
+            Timestamp   = $When.ToString('yyyy-MM-dd HH:mm:ss')
+            ServicePort = $Port
+            Service     = $desc
+            HostRole    = $HostRole
+            Host        = $SourceHost
+            HostPort    = $SourcePort
+            DnsName     = $dns
+            State       = $State
+            Process     = $ProcName
+            PID         = $ProcId
+            AppPool     = $Pool
+        } | Export-Csv -LiteralPath $EventLogFile -Append -NoTypeInformation -Encoding UTF8
+        return
+    }
+
+    $src = "{0}:{1}" -f $SourceHost, $SourcePort
     if ($dns -ne '') { $src = "$src ($dns)" }
     $procPart = "process {0} (PID {1})" -f $ProcName, $ProcId
     if ($Pool -ne '') { $procPart = "process {0} (PID {1}, pool {2})" -f $ProcName, $ProcId, $Pool }
@@ -464,6 +494,33 @@ function Write-EventLog {
 
 function Write-SummaryLog {
     # Connections grouped by source host at each service port, ordered by service port.
+    if ($Csv) {
+        $byPort = $HostPortStats.Values | Group-Object -Property Port | Sort-Object { [int]$_.Name }
+        $rows = @()
+        foreach ($portGroup in $byPort) {
+            $port = [int]$portGroup.Name
+            $desc = Get-PortDescription -Port $port
+            if ([string]::IsNullOrEmpty($desc)) { $desc = 'unknown service' }
+            foreach ($h in ($portGroup.Group | Sort-Object -Property SourceHost)) {
+                $dnsName = ''
+                if ($DnsCache.ContainsKey($h.SourceHost)) { $dnsName = $DnsCache[$h.SourceHost] }
+                $rows += [pscustomobject]@{
+                    ServicePort = $port
+                    Service     = $desc
+                    HostRole    = $HostRole
+                    Host        = $h.SourceHost
+                    DnsName     = $dnsName
+                    Connections = $h.Count
+                    FirstSeen   = $h.FirstSeen.ToString('yyyy-MM-dd HH:mm:ss')
+                    LastSeen    = $h.LastSeen.ToString('yyyy-MM-dd HH:mm:ss')
+                    Processes   = (@($h.Processes.Keys) | Sort-Object) -join ';'
+                }
+            }
+        }
+        $rows | Export-Csv -LiteralPath $SummaryLogFile -NoTypeInformation -Encoding UTF8
+        return
+    }
+
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('==========================================================================')
     [void]$sb.AppendLine(" net-logger summary ($ModeName) - connections by $HostRole host per service port")
@@ -578,9 +635,12 @@ if ($Ports.Count -gt 0) { $portFilterText = ($Ports | Sort-Object) -join ',' }
 elseif ($WellKnownOnly) { $portFilterText = 'well-known' }
 $processFilterText = 'any'
 if ($Process.Count -gt 0) { $processFilterText = $Process -join ',' }
-Add-Content -LiteralPath $EventLogFile -Encoding UTF8 -Value `
-    ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session started on {1} (mode: {2}, ports: {3}, process: {4}) ===" -f `
-     (Get-Date), $env:COMPUTERNAME, $ModeName, $portFilterText, $processFilterText)
+if (-not $Csv) {
+    # Session markers only make sense in the plain-text log format
+    Add-Content -LiteralPath $EventLogFile -Encoding UTF8 -Value `
+        ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session started on {1} (mode: {2}, ports: {3}, process: {4}) ===" -f `
+         (Get-Date), $env:COMPUTERNAME, $ModeName, $portFilterText, $processFilterText)
+}
 
 try {
     while ($true) {
@@ -706,9 +766,11 @@ try {
 finally {
     # Runs on Ctrl+C as well - flush a final summary and close the session cleanly
     if ($HostPortStats.Count -gt 0) { Write-SummaryLog }
-    Add-Content -LiteralPath $EventLogFile -Encoding UTF8 -Value `
-        ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session ended (events: {1}, distinct hosts: {2}) ===" -f `
-         (Get-Date), $TotalEvents, $DistinctHosts.Count)
+    if (-not $Csv) {
+        Add-Content -LiteralPath $EventLogFile -Encoding UTF8 -Value `
+            ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session ended (events: {1}, distinct hosts: {2}) ===" -f `
+             (Get-Date), $TotalEvents, $DistinctHosts.Count)
+    }
     Write-Host ''
     Write-Host ("net-logger stopped. {0} events from {1} distinct hosts. Summary: {2}" -f `
                 $TotalEvents, $DistinctHosts.Count, $SummaryLogFile) -ForegroundColor Cyan

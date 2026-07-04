@@ -22,8 +22,8 @@ Features:
 - Port filtering (`-Ports`, `-WellKnownOnly`), process filtering
   (`-Process`, by name, PID or IIS application pool name), reverse DNS
   resolution (`-ResolveDns`), custom log file (`-LogFile`), refresh rate
-  (`-Refresh`), time-boxed runs (`-RunMinutes`/`-RunSeconds`), and more —
-  run with `-Help` for the full list.
+  (`-Refresh`), time-boxed runs (`-RunMinutes`/`-RunSeconds`), CSV output
+  (`-Csv`), and more — run with `-Help` for the full list.
 - IIS worker processes are labeled with their application pool, e.g.
   `w3wp[MyAppPool]`, on the console and in the logs (requires elevation).
 
