@@ -45,6 +45,17 @@
     when its REMOTE port is a monitored service port, and the logged host is
     the destination host this machine connected to.
 
+.PARAMETER Process
+    Limit monitoring to connections owned by these processes. Accepts process
+    names (without .exe, wildcards allowed) and/or PIDs. Example: -Process w3wp
+    watches only IIS worker process connections. In outbound mode with no
+    -Ports, a process filter watches ALL remote ports (add -WellKnownOnly to
+    restrict to well-known service ports).
+
+.PARAMETER WellKnownOnly
+    Restrict the monitored ports to the built-in well-known service ports.
+    Ignored when -Ports is given.
+
 .PARAMETER RefreshSeconds
     Refresh rate: seconds between polling cycles. Default: 2. Alias: -Refresh.
 
@@ -88,6 +99,11 @@
     with DNS names resolved.
 
 .EXAMPLE
+    .\net-logger.ps1 -Outbound -Process w3wp -ResolveDns
+    Logs every destination host the IIS worker processes connect to, on any
+    remote port, with DNS names resolved.
+
+.EXAMPLE
     .\net-logger.ps1 -Ports 3389 -Refresh 5 -LogFile C:\logs\rdp-watch.log
     Watches incoming RDP connections, polling every 5 seconds, logging to
     C:\logs\rdp-watch.log (summary in C:\logs\rdp-watch_summary.log).
@@ -109,6 +125,10 @@ param(
     [int[]]$Ports = @(),
 
     [switch]$Outbound,
+
+    [string[]]$Process = @(),
+
+    [switch]$WellKnownOnly,
 
     [Alias('Refresh')]
     [ValidateRange(1, 3600)]
@@ -151,6 +171,10 @@ function Show-Usage {
     Write-Host ' PARAMETERS' -ForegroundColor Yellow
     Write-Host '   -Ports <p1,p2,...>     Monitor only these service ports.'
     Write-Host '   -Outbound              Watch outgoing instead of incoming connections.'
+    Write-Host '   -Process <name|pid>    Only connections owned by these processes (names'
+    Write-Host '                          without .exe, wildcards OK, or PIDs). Outbound with'
+    Write-Host '                          -Process and no -Ports watches ALL remote ports.'
+    Write-Host '   -WellKnownOnly         Restrict to well-known service ports.'
     Write-Host '   -RefreshSeconds <n>    Refresh rate in seconds (default 2). Alias: -Refresh.'
     Write-Host '   -LogFile <path>        Output log file for host entries; the summary is'
     Write-Host '                          written next to it as <name>_summary.log.'
@@ -168,6 +192,8 @@ function Show-Usage {
     Write-Host '       Monitor incoming connections on ports 80, 443 and 3389 only.'
     Write-Host '   .\net-logger.ps1 -Outbound -Ports 443 -ResolveDns'
     Write-Host '       Log every destination host reached on port 443, with DNS names.'
+    Write-Host '   .\net-logger.ps1 -Outbound -Process w3wp -ResolveDns'
+    Write-Host '       Log every destination host IIS worker processes connect to.'
     Write-Host '   .\net-logger.ps1 -Ports 3389 -Refresh 5 -LogFile C:\logs\rdp-watch.log'
     Write-Host '       Watch incoming RDP, poll every 5 s, log to a specific file.'
     Write-Host ''
@@ -306,6 +332,25 @@ function Get-ProcessName {
     return $ProcessCache[$ProcessId]
 }
 
+function Test-ProcessMatch {
+    # True when no -Process filter is set, or the owning process matches one of
+    # the given names (wildcards OK, '.exe' ignored) or PIDs.
+    param([int]$OwningPid)
+
+    if ($Process.Count -eq 0) { return $true }
+    $name = Get-ProcessName -ProcessId $OwningPid
+    foreach ($p in $Process) {
+        if ($p -match '^\d+$') {
+            if ($OwningPid -eq [int]$p) { return $true }
+        }
+        else {
+            $pattern = $p -replace '\.exe$', ''
+            if ($name -like $pattern) { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-SourceDnsName {
     # Non-blocking reverse DNS: lookups run on thread-pool threads via
     # GetHostEntryAsync and are cached per IP. Returns '' until a name is known.
@@ -408,9 +453,17 @@ function Show-Console {
     Write-Host ''
     $portsHeader = 'LISTENING SERVICE PORTS'
     if ($Outbound) { $portsHeader = 'MONITORED REMOTE SERVICE PORTS' }
-    Write-Host ("  {0} ({1})" -f $portsHeader, $MonitoredPorts.Count) -ForegroundColor Yellow
+    $portsCount = "$($MonitoredPorts.Count)"
+    if ($watchAllPorts) { $portsCount = 'ALL' }
+    Write-Host ("  {0} ({1})" -f $portsHeader, $portsCount) -ForegroundColor Yellow
     if ($Ports.Count -gt 0) {
         Write-Host ("    port filter: {0}" -f (($Ports | Sort-Object) -join ', ')) -ForegroundColor DarkYellow
+    }
+    if ($Process.Count -gt 0) {
+        Write-Host ("    process filter: {0}" -f ($Process -join ', ')) -ForegroundColor DarkYellow
+    }
+    if ($watchAllPorts) {
+        Write-Host '    (all remote ports - limited by the process filter)' -ForegroundColor Green
     }
     $wellKnown = @($MonitoredPorts | Where-Object { $WellKnownPorts.ContainsKey([int]$_) })
     $others    = @($MonitoredPorts | Where-Object { -not $WellKnownPorts.ContainsKey([int]$_) })
@@ -456,36 +509,51 @@ function Show-Console {
 Write-Host "net-logger starting ($ModeName)... logs -> $LogDirectory"
 $portFilterText = 'all'
 if ($Ports.Count -gt 0) { $portFilterText = ($Ports | Sort-Object) -join ',' }
+elseif ($WellKnownOnly) { $portFilterText = 'well-known' }
+$processFilterText = 'any'
+if ($Process.Count -gt 0) { $processFilterText = $Process -join ',' }
 Add-Content -LiteralPath $EventLogFile -Encoding UTF8 -Value `
-    ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session started on {1} (mode: {2}, ports: {3}) ===" -f `
-     (Get-Date), $env:COMPUTERNAME, $ModeName, $portFilterText)
+    ("{0:yyyy-MM-dd HH:mm:ss} | === net-logger session started on {1} (mode: {2}, ports: {3}, process: {4}) ===" -f `
+     (Get-Date), $env:COMPUTERNAME, $ModeName, $portFilterText, $processFilterText)
 
 try {
     while ($true) {
         # 1. Build the set of service ports to watch
         $watchSet = New-Object 'System.Collections.Generic.HashSet[int]'
+        $watchAllPorts = $false
         if ($Outbound) {
-            # Outbound: the given ports, or every well-known service port by default
+            # Outbound: -Ports wins; else well-known set, except that a process
+            # filter with no port constraints watches ALL remote ports
             if ($Ports.Count -gt 0) { foreach ($p in $Ports) { [void]$watchSet.Add([int]$p) } }
-            else { foreach ($p in @($WellKnownPorts.Keys)) { [void]$watchSet.Add([int]$p) } }
+            elseif ($WellKnownOnly -or $Process.Count -eq 0) {
+                foreach ($p in @($WellKnownPorts.Keys)) { [void]$watchSet.Add([int]$p) }
+            }
+            else { $watchAllPorts = $true }
         }
         else {
-            # Inbound: ports this host is listening on, optionally limited to -Ports
+            # Inbound: ports this host is listening on, optionally limited to
+            # -Ports and/or the well-known set
             $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)
             foreach ($l in $listeners) {
                 $lp = [int]$l.LocalPort
-                if ($Ports.Count -eq 0 -or $Ports -contains $lp) { [void]$watchSet.Add($lp) }
+                if (($Ports.Count -eq 0 -or $Ports -contains $lp) -and
+                    (-not $WellKnownOnly -or $WellKnownPorts.ContainsKey($lp))) {
+                    [void]$watchSet.Add($lp)
+                }
             }
         }
         $monitoredPorts = @($watchSet | Sort-Object)
 
-        # 2. Matching connections: LOCAL port watched (inbound) / REMOTE port watched (outbound)
+        # 2. Matching connections: LOCAL port watched (inbound) / REMOTE port
+        #    watched (outbound), optionally owned by a -Process match
         $connections = @(Get-NetTCPConnection -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.State -ne 'Listen' -and $_.State -ne 'Bound' -and
-                $(if ($Outbound) { $watchSet.Contains([int]$_.RemotePort) }
-                  else           { $watchSet.Contains([int]$_.LocalPort) }) -and
-                ($IncludeLoopback -or ($LoopbackAddresses -notcontains $_.RemoteAddress))
+                ($watchAllPorts -or
+                 $(if ($Outbound) { $watchSet.Contains([int]$_.RemotePort) }
+                   else           { $watchSet.Contains([int]$_.LocalPort) })) -and
+                ($IncludeLoopback -or ($LoopbackAddresses -notcontains $_.RemoteAddress)) -and
+                (Test-ProcessMatch -OwningPid ([int]$_.OwningProcess))
             })
 
         $summaryDirty = $false

@@ -19,7 +19,8 @@ Features:
   listens on, logging the source host of each connection.
 - **Outbound mode** (`-Outbound`): connections this host makes to remote
   service ports, logging the destination host.
-- Port filtering (`-Ports`), reverse DNS resolution (`-ResolveDns`),
+- Port filtering (`-Ports`, `-WellKnownOnly`), process filtering
+  (`-Process`, by name or PID), reverse DNS resolution (`-ResolveDns`),
   custom log file (`-LogFile`), refresh rate (`-Refresh`), and more —
   run with `-Help` for the full list.
 
@@ -34,4 +35,7 @@ Quick example:
 
 # Log every destination host reached on port 443, with DNS names
 .\net-logger.ps1 -Outbound -Ports 443 -ResolveDns
+
+# Log every destination host the IIS worker processes connect to (any port)
+.\net-logger.ps1 -Outbound -Process w3wp -ResolveDns
 ```
