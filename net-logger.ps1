@@ -66,6 +66,12 @@
     process, PID, app pool) and the summary one row per host@port. Auto-named
     files use the .csv extension.
 
+.PARAMETER CsvDelimiter
+    Field delimiter for -Csv output. Default: ',' (comma). Use ';' when the
+    file is opened by Excel configured with a semicolon list separator
+    (common in European/Brazilian regional formats). Note: reading such files
+    with Import-Csv then needs -Delimiter ';'.
+
 .PARAMETER LogFile
     Full path of the output log file for host entries. The summary log is
     written next to it as <name>_summary.log (or .csv with -Csv). Overrides
@@ -152,6 +158,9 @@ param(
 
     [switch]$Csv,
 
+    [ValidateLength(1, 1)]
+    [string]$CsvDelimiter = ',',
+
     [string]$LogFile = '',
 
     [string]$LogDirectory = '',
@@ -200,6 +209,8 @@ function Show-Usage {
     Write-Host '   -WellKnownOnly         Restrict to well-known service ports.'
     Write-Host '   -RefreshSeconds <n>    Refresh rate in seconds (default 2). Alias: -Refresh.'
     Write-Host '   -Csv                   Write logs as CSV files instead of plain text.'
+    Write-Host '   -CsvDelimiter <char>   CSV field delimiter (default ","). Use ";" for'
+    Write-Host '                          Excel with semicolon regional list separators.'
     Write-Host '   -LogFile <path>        Output log file for host entries; the summary is'
     Write-Host '                          written next to it as <name>_summary.log/.csv.'
     Write-Host '   -LogDirectory <path>   Folder for auto-named logs (default: .\logs).'
@@ -479,7 +490,8 @@ function Write-EventLog {
             Process     = $ProcName
             PID         = $ProcId
             AppPool     = $Pool
-        } | Export-Csv -LiteralPath $EventLogFile -Append -NoTypeInformation -Encoding UTF8
+        } | Export-Csv -LiteralPath $EventLogFile -Append -NoTypeInformation -Encoding UTF8 `
+                       -Delimiter ([char]$CsvDelimiter)
         return
     }
 
@@ -517,7 +529,8 @@ function Write-SummaryLog {
                 }
             }
         }
-        $rows | Export-Csv -LiteralPath $SummaryLogFile -NoTypeInformation -Encoding UTF8
+        $rows | Export-Csv -LiteralPath $SummaryLogFile -NoTypeInformation -Encoding UTF8 `
+                           -Delimiter ([char]$CsvDelimiter)
         return
     }
 
