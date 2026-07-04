@@ -48,9 +48,10 @@
 .PARAMETER Process
     Limit monitoring to connections owned by these processes. Accepts process
     names (without .exe, wildcards allowed) and/or PIDs. Example: -Process w3wp
-    watches only IIS worker process connections. In outbound mode with no
-    -Ports, a process filter watches ALL remote ports (add -WellKnownOnly to
-    restrict to well-known service ports).
+    watches only IIS worker process connections. Patterns also match IIS
+    application pool names, so -Process DefaultAppPool watches one specific
+    app pool. In outbound mode with no -Ports, a process filter watches ALL
+    remote ports (add -WellKnownOnly to restrict to well-known service ports).
 
 .PARAMETER WellKnownOnly
     Restrict the monitored ports to the built-in well-known service ports.
@@ -83,7 +84,11 @@
 
 .PARAMETER RunSeconds
     Stop automatically after this many seconds (0 = run until aborted).
-    Mainly useful for testing.
+    Added to -RunMinutes when both are given.
+
+.PARAMETER RunMinutes
+    Stop automatically after this many minutes (0 = run until aborted).
+    Added to -RunSeconds when both are given.
 
 .EXAMPLE
     .\net-logger.ps1
@@ -117,6 +122,9 @@
 
     Requires Windows 8 / Server 2012 or later (Get-NetTCPConnection).
     Process names of listeners resolve best when run as Administrator.
+    IIS worker processes (w3wp) are shown with their application pool name in
+    brackets, e.g. w3wp[MyAppPool], read from the process command line - this
+    also needs an elevated session, since app pools run under other identities.
 #>
 [CmdletBinding()]
 param(
@@ -147,7 +155,10 @@ param(
     [switch]$ResolveDns,
 
     [ValidateRange(0, 86400)]
-    [int]$RunSeconds = 0
+    [int]$RunSeconds = 0,
+
+    [ValidateRange(0, 10080)]
+    [int]$RunMinutes = 0
 )
 
 Set-StrictMode -Version 2.0
@@ -174,8 +185,10 @@ function Show-Usage {
     Write-Host '   -Ports <p1,p2,...>     Monitor only these service ports.'
     Write-Host '   -Outbound              Watch outgoing instead of incoming connections.'
     Write-Host '   -Process <name|pid>    Only connections owned by these processes (names'
-    Write-Host '                          without .exe, wildcards OK, or PIDs). Outbound with'
-    Write-Host '                          -Process and no -Ports watches ALL remote ports.'
+    Write-Host '                          without .exe, wildcards OK, or PIDs). IIS app pool'
+    Write-Host '                          names also match (e.g. -Process DefaultAppPool).'
+    Write-Host '                          Outbound with -Process and no -Ports watches ALL'
+    Write-Host '                          remote ports.'
     Write-Host '   -WellKnownOnly         Restrict to well-known service ports.'
     Write-Host '   -RefreshSeconds <n>    Refresh rate in seconds (default 2). Alias: -Refresh.'
     Write-Host '   -LogFile <path>        Output log file for host entries; the summary is'
@@ -185,6 +198,8 @@ function Show-Usage {
     Write-Host '   -IncludeLoopback       Also report connections from/to 127.0.0.1 / ::1.'
     Write-Host '   -LogAllEvents          Log every connection event, not one entry per host.'
     Write-Host '   -RunSeconds <n>        Stop automatically after n seconds (0 = run forever).'
+    Write-Host '   -RunMinutes <n>        Stop automatically after n minutes; added to'
+    Write-Host '                          -RunSeconds when both are given.'
     Write-Host '   -Help | -h | -?        Show this help.'
     Write-Host ''
     Write-Host ' EXAMPLES' -ForegroundColor Yellow
@@ -273,6 +288,9 @@ function Get-PortDescription {
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+# Total run limit in seconds; 0 = run until aborted
+$RunLimitSeconds = $RunSeconds + ($RunMinutes * 60)
+
 # Mode: inbound logs the SOURCE of incoming connections, outbound the DESTINATION
 $ModeName = 'INBOUND'
 $HostRole = 'source'
@@ -315,6 +333,7 @@ $SeenConnections = @{}   # key: "remoteIP:remotePort->localPort"  (active/known 
 $DistinctHosts   = New-Object 'System.Collections.Generic.HashSet[string]'
 $HostPortStats   = @{}   # key: "localPort|remoteIP" -> stats record
 $ProcessCache    = @{}   # PID -> process name
+$AppPoolCache    = @{}   # PID -> IIS app pool name ('' = none/unknown)
 $DnsCache        = @{}   # IP -> resolved DNS name ('' = lookup done, no name)
 $DnsPending      = @{}   # IP -> in-flight Task[System.Net.IPHostEntry]
 $DnsUpdated      = $false # a pending lookup completed -> refresh summary log
@@ -334,6 +353,45 @@ function Get-ProcessName {
     return $ProcessCache[$ProcessId]
 }
 
+function Get-AppPoolFromCommandLine {
+    # Extracts the IIS application pool name from a w3wp.exe command line
+    # (w3wp.exe -ap "PoolName" ...). Returns '' when there is none.
+    param([string]$CommandLine)
+    if ([string]::IsNullOrEmpty($CommandLine)) { return '' }
+    if ($CommandLine -match '-ap\s+"([^"]+)"') { return $Matches[1] }
+    if ($CommandLine -match '-ap\s+(\S+)')     { return $Matches[1] }
+    return ''
+}
+
+function Get-AppPoolName {
+    # IIS app pool of a worker process (w3wp only), read once from its command
+    # line via CIM and cached. Needs an elevated session for other users' PIDs.
+    param([int]$ProcessId)
+    if (-not $AppPoolCache.ContainsKey($ProcessId)) {
+        $pool = ''
+        if ((Get-ProcessName -ProcessId $ProcessId) -eq 'w3wp') {
+            try {
+                $proc = Get-CimInstance -ClassName Win32_Process `
+                        -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+                if ($null -ne $proc) {
+                    $pool = Get-AppPoolFromCommandLine -CommandLine ([string]$proc.CommandLine)
+                }
+            } catch { }
+        }
+        $AppPoolCache[$ProcessId] = $pool
+    }
+    return $AppPoolCache[$ProcessId]
+}
+
+function Get-ProcessLabel {
+    # Process name, with the IIS app pool in brackets when there is one
+    param([int]$ProcessId)
+    $name = Get-ProcessName -ProcessId $ProcessId
+    $pool = Get-AppPoolName -ProcessId $ProcessId
+    if ($pool -ne '') { return "{0}[{1}]" -f $name, $pool }
+    return $name
+}
+
 function Test-ProcessMatch {
     # True when no -Process filter is set, or the owning process matches one of
     # the given names (wildcards OK, '.exe' ignored) or PIDs.
@@ -341,6 +399,7 @@ function Test-ProcessMatch {
 
     if ($Process.Count -eq 0) { return $true }
     $name = Get-ProcessName -ProcessId $OwningPid
+    $pool = Get-AppPoolName -ProcessId $OwningPid
     foreach ($p in $Process) {
         if ($p -match '^\d+$') {
             if ($OwningPid -eq [int]$p) { return $true }
@@ -348,6 +407,7 @@ function Test-ProcessMatch {
         else {
             $pattern = $p -replace '\.exe$', ''
             if ($name -like $pattern) { return $true }
+            if ($pool -ne '' -and $pool -like $pattern) { return $true }
         }
     }
     return $false
@@ -389,14 +449,16 @@ function Get-SourceDnsName {
 
 function Write-EventLog {
     param([datetime]$When, [int]$Port, [string]$SourceHost, [int]$SourcePort, [string]$State,
-          [string]$ProcName, [int]$ProcId)
+          [string]$ProcName, [int]$ProcId, [string]$Pool = '')
     $desc = Get-PortDescription -Port $Port
     if ([string]::IsNullOrEmpty($desc)) { $desc = 'unknown service' }
     $src = "{0}:{1}" -f $SourceHost, $SourcePort
     $dns = Get-SourceDnsName -Ip $SourceHost
     if ($dns -ne '') { $src = "$src ($dns)" }
-    $line = "{0:yyyy-MM-dd HH:mm:ss} | port {1,5} ({2}) | {3} {4} | {5} | process {6} (PID {7})" -f `
-            $When, $Port, $desc, $HostRole, $src, $State, $ProcName, $ProcId
+    $procPart = "process {0} (PID {1})" -f $ProcName, $ProcId
+    if ($Pool -ne '') { $procPart = "process {0} (PID {1}, pool {2})" -f $ProcName, $ProcId, $Pool }
+    $line = "{0:yyyy-MM-dd HH:mm:ss} | port {1,5} ({2}) | {3} {4} | {5} | {6}" -f `
+            $When, $Port, $desc, $HostRole, $src, $State, $procPart
     Add-Content -LiteralPath $EventLogFile -Value $line -Encoding UTF8
 }
 
@@ -492,13 +554,13 @@ function Show-Console {
         Write-Host '    (none)' -ForegroundColor DarkGray
     }
     else {
-        Write-Host ('    {0,-28} {1,-44} {2,-12} {3,-16} {4}' -f `
+        Write-Host ('    {0,-28} {1,-44} {2,-12} {3,-24} {4}' -f `
                     'LOCAL SOCKET', 'REMOTE SOCKET', 'STATE', 'PROCESS', 'SERVICE') -ForegroundColor White
-        Write-Host ('    ' + ('-' * 116)) -ForegroundColor DarkGray
+        Write-Host ('    ' + ('-' * 124)) -ForegroundColor DarkGray
         foreach ($c in $ActiveConnections) {
             $svcColor = 'DarkGray'
             if ($c.Service -ne '') { $svcColor = 'Green' }
-            Write-Host ('    {0,-28} {1,-44} {2,-12} {3,-16} ' -f `
+            Write-Host ('    {0,-28} {1,-44} {2,-12} {3,-24} ' -f `
                         $c.LocalSocket, $c.RemoteSocket, $c.State, $c.Process) -NoNewline
             Write-Host $c.Service -ForegroundColor $svcColor
         }
@@ -571,8 +633,10 @@ try {
             if ($Outbound) { $port = [int]$conn.RemotePort }
             $srcHost  = [string]$conn.RemoteAddress
             $srcPort  = [int]$conn.RemotePort
-            $ownPid   = [int]$conn.OwningProcess
-            $procName = Get-ProcessName -ProcessId $ownPid
+            $ownPid    = [int]$conn.OwningProcess
+            $procName  = Get-ProcessName -ProcessId $ownPid
+            $procPool  = Get-AppPoolName -ProcessId $ownPid
+            $procLabel = Get-ProcessLabel -ProcessId $ownPid
             $key      = "{0}:{1}<->{2}" -f $srcHost, $srcPort, [int]$conn.LocalPort
             [void]$activeKeys.Add($key)
 
@@ -592,19 +656,19 @@ try {
                         Count      = 1
                         FirstSeen  = $now
                         LastSeen   = $now
-                        Processes  = @{ $procName = $true }
+                        Processes  = @{ $procLabel = $true }
                     }
                 }
                 else {
                     $HostPortStats[$statKey].Count++
                     $HostPortStats[$statKey].LastSeen = $now
-                    $HostPortStats[$statKey].Processes[$procName] = $true
+                    $HostPortStats[$statKey].Processes[$procLabel] = $true
                 }
 
                 # Default: one log entry per individual host at each service port
                 if ($isNewSource -or $LogAllEvents) {
                     Write-EventLog -When $now -Port $port -SourceHost $srcHost -SourcePort $srcPort `
-                                   -State $conn.State -ProcName $procName -ProcId $ownPid
+                                   -State $conn.State -ProcName $procName -ProcId $ownPid -Pool $procPool
                 }
                 $summaryDirty = $true
             }
@@ -618,7 +682,7 @@ try {
                 LocalSocket  = "{0}:{1}" -f $conn.LocalAddress, $conn.LocalPort
                 RemoteSocket = $remoteSocket
                 State        = [string]$conn.State
-                Process      = $procName
+                Process      = $procLabel
                 Service      = Get-PortDescription -Port $port
             }
         }
@@ -635,7 +699,7 @@ try {
         $display = @($display | Sort-Object -Property Port, RemoteSocket)
         Show-Console -MonitoredPorts $monitoredPorts -ActiveConnections $display
 
-        if ($RunSeconds -gt 0 -and ((Get-Date) - $StartTime).TotalSeconds -ge $RunSeconds) { break }
+        if ($RunLimitSeconds -gt 0 -and ((Get-Date) - $StartTime).TotalSeconds -ge $RunLimitSeconds) { break }
         Start-Sleep -Seconds $RefreshSeconds
     }
 }
