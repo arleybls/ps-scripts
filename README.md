@@ -19,7 +19,7 @@ Features:
   listens on, logging the source host of each connection.
 - **Outbound mode** (`-Outbound`): connections this host makes to remote
   service ports, logging the destination host.
-- Port filtering (`-Ports`, `-WellKnownOnly`), process filtering
+- Port filtering (`-Ports`, `-ExcludePorts`, `-WellKnownOnly`), process filtering
   (`-Process`, by name, PID or IIS application pool name), reverse DNS
   resolution (`-ResolveDns`), custom log file (`-LogFile`), refresh rate
   (`-Refresh`), time-boxed runs (`-RunMinutes`/`-RunSeconds`), CSV output

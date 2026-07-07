@@ -34,6 +34,12 @@
     Show usage help with examples and exit. Aliases: -h. PowerShell's built-in
     "-?" also works and shows this comment-based help via Get-Help.
 
+.PARAMETER ExcludePorts
+    List of service ports to ignore. Connections on these ports are never
+    shown or logged, in either mode. Exclusion wins over every other port
+    selection (-Ports, -WellKnownOnly, the all-ports scope of -Process).
+    Alias: -IgnorePorts.
+
 .PARAMETER Ports
     List of service ports to monitor. Inbound mode: only these listening ports
     are watched. Outbound mode: only connections to these remote ports are
@@ -111,6 +117,10 @@
     Monitors incoming connections on ports 80, 443 and 3389 only.
 
 .EXAMPLE
+    .\net-logger.ps1 -ExcludePorts 5985,5986
+    Monitors all listening ports except WinRM (5985/5986).
+
+.EXAMPLE
     .\net-logger.ps1 -Outbound -Ports 443 -ResolveDns
     Logs every destination host this machine connects to on port 443,
     with DNS names resolved.
@@ -145,6 +155,10 @@ param(
 
     [ValidateRange(1, 65535)]
     [int[]]$Ports = @(),
+
+    [Alias('IgnorePorts')]
+    [ValidateRange(1, 65535)]
+    [int[]]$ExcludePorts = @(),
 
     [switch]$Outbound,
 
@@ -200,6 +214,8 @@ function Show-Usage {
     Write-Host ''
     Write-Host ' PARAMETERS' -ForegroundColor Yellow
     Write-Host '   -Ports <p1,p2,...>     Monitor only these service ports.'
+    Write-Host '   -ExcludePorts <p,...>  Ignore these service ports (wins over any other'
+    Write-Host '                          port selection). Alias: -IgnorePorts.'
     Write-Host '   -Outbound              Watch outgoing instead of incoming connections.'
     Write-Host '   -Process <name|pid>    Only connections owned by these processes (names'
     Write-Host '                          without .exe, wildcards OK, or PIDs). IIS app pool'
@@ -310,6 +326,10 @@ function Get-PortDescription {
 # ---------------------------------------------------------------------------
 # Total run limit in seconds; 0 = run until aborted
 $RunLimitSeconds = $RunSeconds + ($RunMinutes * 60)
+
+# Ports to ignore; exclusion wins over any other port selection
+$ExcludeSet = New-Object 'System.Collections.Generic.HashSet[int]'
+foreach ($p in $ExcludePorts) { [void]$ExcludeSet.Add([int]$p) }
 
 # Mode: inbound logs the SOURCE of incoming connections, outbound the DESTINATION
 $ModeName = 'INBOUND'
@@ -595,6 +615,9 @@ function Show-Console {
     if ($Ports.Count -gt 0) {
         Write-Host ("    port filter: {0}" -f (($Ports | Sort-Object) -join ', ')) -ForegroundColor DarkYellow
     }
+    if ($ExcludePorts.Count -gt 0) {
+        Write-Host ("    excluded ports: {0}" -f (($ExcludePorts | Sort-Object) -join ', ')) -ForegroundColor DarkYellow
+    }
     if ($Process.Count -gt 0) {
         Write-Host ("    process filter: {0}" -f ($Process -join ', ')) -ForegroundColor DarkYellow
     }
@@ -646,6 +669,9 @@ Write-Host "net-logger starting ($ModeName)... logs -> $LogDirectory"
 $portFilterText = 'all'
 if ($Ports.Count -gt 0) { $portFilterText = ($Ports | Sort-Object) -join ',' }
 elseif ($WellKnownOnly) { $portFilterText = 'well-known' }
+if ($ExcludePorts.Count -gt 0) {
+    $portFilterText += ' excluding ' + (($ExcludePorts | Sort-Object) -join ',')
+}
 $processFilterText = 'any'
 if ($Process.Count -gt 0) { $processFilterText = $Process -join ',' }
 if (-not $Csv) {
@@ -681,6 +707,7 @@ try {
                 }
             }
         }
+        foreach ($p in $ExcludePorts) { [void]$watchSet.Remove([int]$p) }
         $monitoredPorts = @($watchSet | Sort-Object)
 
         # 2. Matching connections: LOCAL port watched (inbound) / REMOTE port
@@ -688,9 +715,9 @@ try {
         $connections = @(Get-NetTCPConnection -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.State -ne 'Listen' -and $_.State -ne 'Bound' -and
-                ($watchAllPorts -or
-                 $(if ($Outbound) { $watchSet.Contains([int]$_.RemotePort) }
-                   else           { $watchSet.Contains([int]$_.LocalPort) })) -and
+                $(if ($Outbound) { -not $ExcludeSet.Contains([int]$_.RemotePort) -and
+                                   ($watchAllPorts -or $watchSet.Contains([int]$_.RemotePort)) }
+                  else           { $watchSet.Contains([int]$_.LocalPort) }) -and
                 ($IncludeLoopback -or ($LoopbackAddresses -notcontains $_.RemoteAddress)) -and
                 (Test-ProcessMatch -OwningPid ([int]$_.OwningProcess))
             })
