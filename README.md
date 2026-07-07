@@ -37,6 +37,9 @@ Quick example:
 # Watch incoming RDP only, polling every 5 s, logging to a specific file
 .\net-logger.ps1 -Ports 3389 -Refresh 5 -LogFile C:\logs\rdp-watch.log
 
+# Watch all listening ports except WinRM (5985/5986)
+.\net-logger.ps1 -ExcludePorts 5985,5986
+
 # Log every destination host reached on port 443, with DNS names
 .\net-logger.ps1 -Outbound -Ports 443 -ResolveDns
 
